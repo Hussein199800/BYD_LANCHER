@@ -28,6 +28,8 @@ import java.util.concurrent.TimeoutException
  */
 class Probe(
     private val context: Context,
+    /** Lines describing the runtime permission request made before the probe started. */
+    private val preamble: List<String>,
     private val emit: (String) -> Unit,
     private val status: (String) -> Unit,
 ) {
@@ -39,6 +41,12 @@ class Probe(
         var gettersOk = 0
         var gettersFailed = 0
         var gettersDenied = 0
+        /** Calls that returned a BYD error code instead of a value. */
+        var gettersInvalid = 0
+        var getPermissionsTotal = 0
+        var getPermissionsGranted = 0
+        val getPermissionLevels = java.util.TreeMap<String, Int>()
+        var adbSummary = ""
         var bydPermissionsDefined = 0
         var bydPermissionsGranted = 0
         val deviceLines = ArrayList<String>()
@@ -57,7 +65,10 @@ class Probe(
             section("SYSTEM PROPERTIES (filtered)") { systemProps() }
             section("SHARED LIBRARIES") { sharedLibraries() }
             section("BYD-RELATED PACKAGES") { bydPackages() }
+            section("RUNTIME PERMISSION REQUEST") { preamble.forEach(emit) }
             section("BYD PERMISSIONS") { bydPermissions() }
+            section("DEBUG / ADB STATE") { debugState() }
+            section("STANDARD ANDROID CHANNELS") { standardChannels() }
             val classes = sectionResult("BYDAUTO CLASS DISCOVERY") { discoverClasses() }
             section("DEVICE PROBES") { probeDevices(classes) }
         } finally {
@@ -151,41 +162,86 @@ class Probe(
 
     private fun bydPermissions() {
         val pm = context.packageManager
-        val defined = LinkedHashMap<String, PermissionInfo>()
-        // Asking for every package's permissions at once can exceed the binder
-        // transaction limit, so walk the packages one by one.
-        for (p in installedPackages(0)) {
-            val info = try {
-                @Suppress("DEPRECATION") pm.getPackageInfo(p.packageName, PackageManager.GET_PERMISSIONS)
-            } catch (t: Throwable) {
-                continue
-            }
-            for (perm in info.permissions ?: continue) {
-                if (perm.name.contains("BYD", ignoreCase = true)) defined[perm.name] = perm
-            }
-        }
-        summary.bydPermissionsDefined = defined.size
-        for ((name, perm) in defined.toSortedMap()) {
-            val granted = pm.checkPermission(name, context.packageName) == PackageManager.PERMISSION_GRANTED
-            if (granted) summary.bydPermissionsGranted++
-            emit("${if (granted) "[GRANTED]" else "[  --   ]"} $name  level=${protection(perm)}  by=${perm.packageName}")
-        }
-        emit("(${defined.size} BYD permissions defined on this system, ${summary.bydPermissionsGranted} granted to this app)")
-
-        emit("-- requested by this app:")
         val mine = try {
             @Suppress("DEPRECATION")
             pm.getPackageInfo(context.packageName, PackageManager.GET_PERMISSIONS)
         } catch (t: Throwable) {
             null
         }
-        val names = mine?.requestedPermissions ?: emptyArray()
-        val flags = mine?.requestedPermissionsFlags ?: IntArray(0)
-        for (i in names.indices) {
-            val granted = (flags.getOrElse(i) { 0 } and PackageInfo.REQUESTED_PERMISSION_GRANTED) != 0
-            val known = defined.containsKey(names[i]) || !names[i].contains("BYD")
-            emit("${if (granted) "[GRANTED]" else "[  --   ]"} ${names[i]}${if (known) "" else "  (not defined on this system)"}")
+        val names = (mine?.requestedPermissions ?: emptyArray()).filter { it.contains("BYDAUTO") }.sorted()
+        // Looked up one by one: listing all packages is filtered on this system.
+        for (name in names) {
+            val granted = pm.checkPermission(name, context.packageName) == PackageManager.PERMISSION_GRANTED
+            val info = try { pm.getPermissionInfo(name, 0) } catch (t: Throwable) { null }
+            val level = if (info == null) "UNDEFINED" else protection(info)
+            val holders = try {
+                @Suppress("DEPRECATION")
+                pm.getPackagesHoldingPermissions(arrayOf(name), 0).map { it.packageName }
+            } catch (t: Throwable) {
+                emptyList()
+            }
+            if (name.endsWith("_GET")) {
+                summary.getPermissionsTotal++
+                if (granted) summary.getPermissionsGranted++
+                summary.getPermissionLevels[level] = (summary.getPermissionLevels[level] ?: 0) + 1
+            }
+            emit(
+                "${if (granted) "[GRANTED]" else "[  --   ]"} $name  level=$level" +
+                    "  definedBy=${info?.packageName ?: "?"}" +
+                    "  holders(${holders.size})=${holders.take(8).joinToString(",")}"
+            )
         }
+        emit("GET permissions: ${summary.getPermissionsGranted}/${summary.getPermissionsTotal} granted; levels=${summary.getPermissionLevels}")
+        emit("installed packages visible to this app: ${installedPackages(0).size}")
+    }
+
+    /** Reads (never changes) the debugging state, to know whether an ADB grant is an option. */
+    private fun debugState() {
+        val cr = context.contentResolver
+        val settings = LinkedHashMap<String, String>()
+        for (key in listOf("adb_enabled", "development_settings_enabled", "adb_wifi_enabled")) {
+            settings[key] = try {
+                android.provider.Settings.Global.getString(cr, key) ?: "null"
+            } catch (t: Throwable) {
+                "ERR ${t.javaClass.simpleName}"
+            }
+            emit("settings.global.$key=${settings[key]}")
+        }
+        val props = Regex("adb|debuggable|ro\\.secure|usb\\.config|usb\\.state", RegexOption.IGNORE_CASE)
+        try {
+            val proc = Runtime.getRuntime().exec("getprop")
+            proc.inputStream.bufferedReader().readLines().filter { props.containsMatchIn(it) }.forEach { emit(it) }
+            proc.waitFor()
+        } catch (t: Throwable) {
+            emit("!! getprop failed: ${describe(t)}")
+        }
+        // Only checks whether the port accepts a connection; nothing is sent.
+        val open = ArrayList<Int>()
+        for (port in listOf(5555, 5037)) {
+            val state = try {
+                java.net.Socket().use { it.connect(java.net.InetSocketAddress("127.0.0.1", port), 800) }
+                open.add(port)
+                "OPEN"
+            } catch (t: Throwable) {
+                "closed (${t.javaClass.simpleName})"
+            }
+            emit("localhost:$port $state")
+        }
+        summary.adbSummary = "adb_enabled=${settings["adb_enabled"]} dev=${settings["development_settings_enabled"]} " +
+            "localPorts=${if (open.isEmpty()) "none" else open.joinToString(",")}"
+    }
+
+    /** Vehicle-related data that plain Android APIs may expose without BYD permissions. */
+    private fun standardChannels() {
+        val sm = context.getSystemService(Context.SENSOR_SERVICE) as android.hardware.SensorManager
+        val sensors = sm.getSensorList(android.hardware.Sensor.TYPE_ALL)
+        emit("sensors: ${sensors.size}")
+        for (sensor in sensors) emit("   type=${sensor.type} ${sensor.name} (${sensor.vendor})")
+        val lm = context.getSystemService(Context.LOCATION_SERVICE) as android.location.LocationManager
+        emit("location providers: ${lm.allProviders}")
+        emit("feature automotive: ${context.packageManager.hasSystemFeature("android.hardware.type.automotive")}")
+        val carClass = try { Class.forName("android.car.Car").name } catch (t: Throwable) { "absent" }
+        emit("android.car.Car: $carClass")
     }
 
     private fun protection(p: PermissionInfo): String {
@@ -365,6 +421,7 @@ class Probe(
         var ok = 0
         var failed = 0
         var denied = 0
+        var invalid = 0
         val others = ArrayList<String>()
         val methods = cls.declaredMethods
             .filter { Modifier.isPublic(it.modifiers) && !Modifier.isStatic(it.modifiers) }
@@ -377,21 +434,24 @@ class Probe(
                 isGetter && params.isEmpty() -> {
                     val r = call(m, instance)
                     emit("${m.name}() -> ${r.text}")
-                    if (r.ok) ok++ else if (r.denied) denied++ else failed++
+                    if (m.name in META_GETTERS) continue
+                    if (r.ok) ok++ else if (r.denied) denied++ else if (r.invalid) invalid++ else failed++
                 }
                 isGetter && params.size == 1 && params[0] == Int::class.javaPrimitiveType -> {
                     val parts = ArrayList<String>()
                     var anyOk = false
                     var anyDenied = false
+                    var anyInvalid = false
                     for (arg in 0..4) {
                         val r = call(m, instance, arg)
                         parts.add("[$arg]=${r.text}")
                         anyOk = anyOk || r.ok
                         anyDenied = anyDenied || r.denied
+                        anyInvalid = anyInvalid || r.invalid
                         if (r.denied || r.timedOut) break
                     }
                     emit("${m.name}(int) -> ${parts.joinToString("  ")}")
-                    if (anyOk) ok++ else if (anyDenied) denied++ else failed++
+                    if (anyOk) ok++ else if (anyDenied) denied++ else if (anyInvalid) invalid++ else failed++
                 }
                 else -> others.add(signature(m))
             }
@@ -403,17 +463,40 @@ class Probe(
         summary.gettersOk += ok
         summary.gettersFailed += failed
         summary.gettersDenied += denied
+        summary.gettersInvalid += invalid
         val mark = if (ok > 0) "✓" else "✗"
-        summary.deviceLines.add("$mark $short: ok=$ok denied=$denied failed=$failed")
+        summary.deviceLines.add("$mark $short: ok=$ok denied=$denied errcode=$invalid failed=$failed")
     }
 
-    private class CallResult(val text: String, val ok: Boolean, val denied: Boolean = false, val timedOut: Boolean = false)
+    private class CallResult(
+        val text: String,
+        val ok: Boolean,
+        val denied: Boolean = false,
+        val timedOut: Boolean = false,
+        val invalid: Boolean = false,
+    )
+
+    /**
+     * BYD getters signal failure with codes just above Int.MIN_VALUE (e.g. -2147482648 =
+     * COMMAND_FAILED) rather than by throwing, so those are not real readings.
+     */
+    private fun isErrorCode(value: Any?): Boolean = when (value) {
+        is Int -> value < ERROR_CODE_CEILING
+        is Long -> value < ERROR_CODE_CEILING
+        is Float -> value < ERROR_CODE_CEILING
+        is Double -> value < ERROR_CODE_CEILING
+        else -> false
+    }
 
     private fun call(m: Method, target: Any, vararg args: Any?): CallResult {
         val future = pool.submit(Callable { m.invoke(target, *args) })
         return try {
             val value = future.get(CALL_TIMEOUT_SECONDS, TimeUnit.SECONDS)
-            CallResult(format(m.name, value), ok = true)
+            if (isErrorCode(value)) {
+                CallResult("${format(m.name, value)} (BYD error code)", ok = false, invalid = true)
+            } else {
+                CallResult(format(m.name, value), ok = true)
+            }
         } catch (t: TimeoutException) {
             future.cancel(true)
             CallResult("TIMEOUT", ok = false, timedOut = true)
@@ -460,6 +543,9 @@ class Probe(
     companion object {
         private const val BYD_PREFIX = "android.hardware.bydauto."
         private const val CALL_TIMEOUT_SECONDS = 3L
+        private const val ERROR_CODE_CEILING = -2_000_000_000
+        /** Getters every device has that describe the API itself, not the car. */
+        private val META_GETTERS = setOf("getGetPermission", "getSetPermission", "getDevicetype", "getType", "getFeatureList")
         private val GETTER = Regex("^(get|is|has)[A-Z0-9_]")
         private val SENSITIVE = Regex("vin|serial|imei|iccid|imsi|mac|sn$|account|phone|token", RegexOption.IGNORE_CASE)
 

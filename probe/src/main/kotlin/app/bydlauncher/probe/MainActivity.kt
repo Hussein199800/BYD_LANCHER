@@ -38,6 +38,7 @@ class MainActivity : Activity() {
 
     private var worker: HandlerThread? = null
     private var server: ReportServer? = null
+    private val permissionLog = ArrayList<String>()
     private val reportFile: File by lazy { File(getExternalFilesDir(null) ?: filesDir, REPORT_NAME) }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -46,6 +47,7 @@ class MainActivity : Activity() {
         server = ReportServer(PORT) { reportFile }.also { it.start() }
 
         val missing = missingPermissions()
+        permissionLog.add("not granted at launch: ${missing.size}")
         if (Build.VERSION.SDK_INT >= 23 && missing.isNotEmpty()) {
             // Only "dangerous" permissions show a dialog; the rest return immediately.
             requestPermissions(missing, 1)
@@ -55,6 +57,10 @@ class MainActivity : Activity() {
     }
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<String>, grantResults: IntArray) {
+        val granted = permissions.filterIndexed { i, _ -> grantResults.getOrNull(i) == PackageManager.PERMISSION_GRANTED }
+        permissionLog.add("requested at runtime: ${permissions.size}, granted by the request: ${granted.size}")
+        granted.forEach { permissionLog.add("   granted: $it") }
+        if (permissions.isEmpty()) permissionLog.add("   (request was cancelled or produced no result)")
         startProbe()
     }
 
@@ -98,7 +104,7 @@ class MainActivity : Activity() {
                 try { writer?.apply { write(line); newLine(); flush() } } catch (_: Throwable) {}
             }
             emit("BYD Probe v${BuildConfig.VERSION_NAME}  ${SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())}")
-            val probe = Probe(this, emit) { s -> ui.post { statusView.text = "جارٍ الفحص: $s" } }
+            val probe = Probe(this, ArrayList(permissionLog), emit) { s -> ui.post { statusView.text = "جارٍ الفحص: $s" } }
             try {
                 probe.run()
             } catch (t: Throwable) {
@@ -127,14 +133,20 @@ class MainActivity : Activity() {
         val dm = resources.displayMetrics
         append("الشاشة: ${dm.widthPixels}×${dm.heightPixels} بكسل، ${dm.densityDpi}dpi\n")
         append("أصناف bydauto المكتشفة: ${s.classesFound}\n")
-        append("أذونات BYD المعرّفة: ${s.bydPermissionsDefined} — الممنوحة لهذا التطبيق: ${s.bydPermissionsGranted}\n")
+        append("أذونات القراءة (GET): الممنوحة ${s.getPermissionsGranted} من ${s.getPermissionsTotal}\n")
+        append("مستوى حماية أذونات القراءة: ${s.getPermissionLevels}\n")
+        append("حالة ADB: ${s.adbSummary}\n")
         append("الواجهات: تعمل ${s.devicesOk} — فشلت ${s.devicesFailed}\n")
-        append("القراءات: نجحت ${s.gettersOk} — مرفوضة بالصلاحيات ${s.gettersDenied} — فشلت ${s.gettersFailed}\n")
+        append(
+            "قراءات السيارة: حقيقية ${s.gettersOk} — مرفوضة بالصلاحيات ${s.gettersDenied}" +
+                " — رمز خطأ ${s.gettersInvalid} — فشلت ${s.gettersFailed}\n"
+        )
         append("\n")
         append(
             when {
                 s.classesFound == 0 -> "النتيجة: واجهات السيارة غير ظاهرة لهذا التطبيق."
                 s.gettersOk == 0 -> "النتيجة: الواجهات موجودة لكن لم تنجح أي قراءة."
+                s.gettersDenied > s.gettersOk -> "النتيجة: أغلب القراءات مرفوضة بالصلاحيات."
                 else -> "النتيجة: توجد قراءات حقيقية متاحة ✓"
             }
         )
