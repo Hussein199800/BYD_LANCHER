@@ -1,0 +1,43 @@
+name: Build probe APK
+
+on:
+  push:
+    paths:
+      - "probe/**"
+      - "*.gradle.kts"
+      - "gradle/**"
+      - "gradle.properties"
+      - ".github/workflows/build-probe.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Build debug APK
+        run: ./gradlew --no-daemon :probe:assembleDebug
+      - name: Rename APK
+        run: cp probe/build/outputs/apk/debug/probe-debug.apk byd-probe.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: byd-probe
+          path: byd-probe.apk
+      - name: Publish to the "probe-latest" pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete probe-latest --yes --cleanup-tag || true
+          gh release create probe-latest byd-probe.apk \
+            --prerelease \
+            --target "$GITHUB_SHA" \
+            --title "BYD Probe (latest build)" \
+            --notes "Read-only DiLink compatibility probe. Built from $GITHUB_SHA."
