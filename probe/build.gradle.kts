@@ -13,8 +13,8 @@ android {
         // Kept low on purpose: a diagnostic tool that reads OEM framework classes by
         // reflection, which newer target levels restrict more tightly.
         targetSdk = 27
-        versionCode = 2
-        versionName = "0.2"
+        versionCode = 3
+        versionName = "0.3"
     }
 
     signingConfigs {

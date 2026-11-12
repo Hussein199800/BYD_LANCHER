@@ -136,6 +136,7 @@ class MainActivity : Activity() {
         append("أذونات القراءة (GET): الممنوحة ${s.getPermissionsGranted} من ${s.getPermissionsTotal}\n")
         append("مستوى حماية أذونات القراءة: ${s.getPermissionLevels}\n")
         append("حالة ADB: ${s.adbSummary}\n")
+        append("مالكو أذونات القراءة: ${s.holderSummary}\n")
         append("الواجهات: تعمل ${s.devicesOk} — فشلت ${s.devicesFailed}\n")
         append(
             "قراءات السيارة: حقيقية ${s.gettersOk} — مرفوضة بالصلاحيات ${s.gettersDenied}" +

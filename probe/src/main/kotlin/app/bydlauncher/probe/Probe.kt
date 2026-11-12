@@ -47,6 +47,7 @@ class Probe(
         var getPermissionsGranted = 0
         val getPermissionLevels = java.util.TreeMap<String, Int>()
         var adbSummary = ""
+        var holderSummary = ""
         var bydPermissionsDefined = 0
         var bydPermissionsGranted = 0
         val deviceLines = ArrayList<String>()
@@ -67,6 +68,7 @@ class Probe(
             section("BYD-RELATED PACKAGES") { bydPackages() }
             section("RUNTIME PERMISSION REQUEST") { preamble.forEach(emit) }
             section("BYD PERMISSIONS") { bydPermissions() }
+            section("WHO HOLDS THE KEY READ PERMISSIONS") { permissionHolders() }
             section("DEBUG / ADB STATE") { debugState() }
             section("STANDARD ANDROID CHANNELS") { standardChannels() }
             val classes = sectionResult("BYDAUTO CLASS DISCOVERY") { discoverClasses() }
@@ -193,6 +195,49 @@ class Probe(
         }
         emit("GET permissions: ${summary.getPermissionsGranted}/${summary.getPermissionsTotal} granted; levels=${summary.getPermissionLevels}")
         emit("installed packages visible to this app: ${installedPackages(0).size}")
+    }
+
+    /**
+     * Full holder list for the permissions that matter most. Two things are being looked
+     * for: whether the ADB shell identity holds them, and whether any user-installed
+     * (non-system) app does, which would prove a route other than BYD's signature exists.
+     */
+    private fun permissionHolders() {
+        val pm = context.packageManager
+        val key = listOf("SPEED", "STATISTIC", "ENGINE", "GEARBOX", "ENERGY", "CHARGING", "BODYWORK", "INSTRUMENT", "TYRE", "AC")
+            .map { "android.permission.BYDAUTO_${it}_GET" }
+        val held = java.util.TreeMap<String, Int>()
+        val info = HashMap<String, PackageInfo>()
+        for (perm in key) {
+            val holders = try {
+                @Suppress("DEPRECATION") pm.getPackagesHoldingPermissions(arrayOf(perm), 0)
+            } catch (t: Throwable) {
+                emit("!! $perm: ${describe(t)}")
+                continue
+            }
+            for (h in holders) {
+                held[h.packageName] = (held[h.packageName] ?: 0) + 1
+                info[h.packageName] = h
+            }
+        }
+        var userApps = 0
+        for ((pkg, count) in held) {
+            val app = info[pkg]?.applicationInfo
+            val system = app != null && (app.flags and android.content.pm.ApplicationInfo.FLAG_SYSTEM) != 0
+            if (!system) userApps++
+            val dir = app?.sourceDir?.split('/')?.take(3)?.joinToString("/") ?: "?"
+            emit("${if (system) "[SYS ]" else "[USER]"} $pkg  holds=$count/${key.size}  v${info[pkg]?.versionName}  $dir")
+        }
+        val shell = held["com.android.shell"]
+        summary.holderSummary = "holders=${held.size} userInstalled=$userApps shell=${shell ?: 0}/${key.size}"
+        emit(summary.holderSummary)
+        for (pkg in listOf("com.android.shell", "android", "com.android.systemui", "com.android.settings")) {
+            val n = key.count { pm.checkPermission(it, pkg) == PackageManager.PERMISSION_GRANTED }
+            emit("checkPermission $pkg: $n/${key.size}")
+        }
+        for (f in listOf("android.hardware.bluetooth", "android.hardware.bluetooth_le", "android.hardware.usb.host", "android.hardware.wifi")) {
+            emit("feature $f: ${pm.hasSystemFeature(f)}")
+        }
     }
 
     /** Reads (never changes) the debugging state, to know whether an ADB grant is an option. */
